@@ -32,9 +32,9 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # Check if required tools are installed
-for tool in dd mkisofs gzip mdadm; do
+for tool in dd genisoimage gzip mdadm; do
     if ! command -v $tool &>/dev/null; then
-        log_message "$tool is not installed. Please install it (e.g., 'apt install $tool' or 'yum install $tool')." "${RED}"
+        log_message "$tool is not installed. Please install it (e.g., 'apt install $tool')." "${RED}"
         exit 1
     fi
 done
@@ -83,7 +83,7 @@ fi
 # Check if disk is mounted
 if grep -qs "$DISK" "$MOUNT_CHECK"; then
     log_message "Warning: $DISK or its partitions are mounted. This may cause data corruption in the backup." "${YELLOW}"
-    log_message "For a clean backup, boot from a live CD/USB (e.g., SystemRescueCD) or stop services and unmount partitions." "${YELLOW}"
+    log_message "For a cleaner backup, boot from a live CD/USB (e.g., SystemRescueCD) or stop services and unmount partitions." "${YELLOW}"
     read -p "Continue anyway? (y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_message "Aborting at user request." "${RED}"
@@ -129,7 +129,7 @@ gzip "$OUTPUT_DIR/$RAW_IMAGE" || {
 
 # Create bootable ISO
 log_message "Creating bootable ISO image..." "${GREEN}"
-mkisofs -o "$OUTPUT_DIR/$ISO_NAME" -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
+genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
     log_message "Failed to create ISO image." "${RED}"
     exit 1
 }
