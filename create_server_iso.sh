@@ -29,11 +29,17 @@ log_message() {
 check_gzip_integrity() {
     local file="$1"
     if [[ -f "$file" ]]; then
+        log_message "Starting gzip integrity check for $file..." "${GREEN}"
+        start_time=$(date +%s)
         if gzip -t "$file" 2>/dev/null; then
-            log_message "Gzip file $file is valid." "${GREEN}"
+            end_time=$(date +%s)
+            duration=$((end_time - start_time))
+            log_message "Gzip file $file is valid. Verification took $duration seconds." "${GREEN}"
             return 0
         else
-            log_message "Gzip file $file is incomplete or corrupted. Removing..." "${YELLOW}"
+            end_time=$(date +%s)
+            duration=$((end_time - start_time))
+            log_message "Gzip file $file is incomplete or corrupted. Verification took $duration seconds. Removing..." "${YELLOW}"
             rm -f "$file"
             return 1
         fi
@@ -66,7 +72,7 @@ log_message "Root privileges confirmed." "${GREEN}"
 
 # Step 2: Check if required tools are installed
 log_message "Step 2: Checking for required tools..." "${GREEN}"
-for tool in dd genisoimage gzip mdadm; do
+for tool in dd genisoimage gzip mdadm pv; do
     if ! command -v $tool &>/dev/null; then
         log_message "$tool is not installed. Please install it (e.g., 'apt install $tool')." "${RED}"
         exit 1
@@ -203,12 +209,12 @@ fi
 
 # Step 13: Compress the raw image (if needed)
 if [[ -z "$COMPRESSION_SKIPPED" ]]; then
-    log_message "Step 13: Compressing raw image to save space..." "${GREEN}"
-    nice -n 10 gzip "$OUTPUT_DIR/$RAW_IMAGE" || {
+    log_message "Step 13: Compressing raw image to save space with progress bar..." "${GREEN}"
+    nice -n 10 pv "$OUTPUT_DIR/$RAW_IMAGE" | gzip > "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
         log_message "Failed to compress image." "${RED}"
         exit 1
     }
-    log_message "Raw image compressed successfully to $OUTPUT_DIR/$COMRESSED_IMAGE." "${GREEN}"
+    log_message "Raw image compressed successfully to $OUTPUT_DIR/$COMPRESSED_IMAGE." "${GREEN}"
 else
     log_message "Step 13: Skipping compression due to valid existing compressed image." "${GREEN}"
 fi
