@@ -19,6 +19,7 @@ RAW_IMAGE="raw_backup.img"
 COMPRESSED_IMAGE="raw_backup.img.gz"
 MIN_SPACE_GB=10 # Minimum free space required in GB
 MOUNT_CHECK="/proc/mounts"
+MAX_ISO_FILE_SIZE=$((4 * 1024 * 1024 * 1024)) # 4GiB limit for ISO files
 
 # Function to log messages
 log_message() {
@@ -186,7 +187,11 @@ log_message "Step 11: Checking for existing compressed image $OUTPUT_DIR/$COMPRE
 if [[ -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" ]]; then
     log_message "Compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE exists. Verifying integrity..." "${YELLOW}"
     if check_gzip_integrity "$OUTPUT_DIR/$COMPRESSED_IMAGE"; then
-        log_message "Existing compressed image is valid. Skipping raw image creation and compression." "${GREEN}"
+        log_message "Existing compressed image is valid. Checking size for ISO compatibility..." "${GREEN}"
+        COMPRESSED_SIZE=$(stat -c %s "$OUTPUT_DIR/$COMPRESSED_IMAGE")
+        if [[ "$COMPRESSED_SIZE" -gt "$MAX_ISO_FILE_SIZE" ]]; then
+            log_message "Warning: Compressed image ($COMPRESSED_SIZE bytes) exceeds 4GiB. Using -allow-limited-size for ISO creation." "${YELLOW}"
+        fi
         COMPRESSION_SKIPPED=1
     else
         log_message "Removing incomplete compressed image and restarting compression." "${YELLOW}"
@@ -221,7 +226,7 @@ fi
 
 # Step 14: Create bootable ISO
 log_message "Step 14: Creating bootable ISO image..." "${GREEN}"
-genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
+genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -allow-limited-size "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
     log_message "Failed to create ISO image." "${RED}"
     exit 1
 }
