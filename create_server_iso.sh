@@ -14,7 +14,6 @@ NC='\033[0m' # No Color
 # Configuration (adjust these as needed)
 DISK="/dev/sda" # Disk to backup (RAID1 member)
 OUTPUT_DIR="/mnt/localdisk" # Directory to store the ISO (must not be on /dev/sda or /dev/sdb)
-TEMP_DIR="/tmp" # Temporary directory for local file operations
 ISO_NAME="server_backup_$(date +%Y%m%d_%H%M%S).iso"
 RAW_IMAGE="raw_backup.img"
 COMPRESSED_IMAGE="raw_backup.img.gz"
@@ -77,6 +76,23 @@ check_file_in_use() {
     fi
 }
 
+# Function to check SSHFS mount integrity
+check_sshfs_mount() {
+    local mount_point="$1"
+    if ! mountpoint -q "$mount_point"; then
+        log_message "Error: $mount_point is not a valid mount point. Exiting." "${RED}"
+        exit 1
+    fi
+    # Test write to ensure mount is functional
+    local test_file="$mount_point/.test_$(date +%s)"
+    if ! touch "$test_file" 2>/dev/null; then
+        log_message "Error: Cannot write to $mount_point. SSHFS mount may be broken. Exiting." "${RED}"
+        exit 1
+    fi
+    rm -f "$test_file"
+    log_message "$mount_point is mounted and writable." "${GREEN}"
+}
+
 # Step 1: Check if running as root
 log_message "Step 1: Verifying root privileges..." "${GREEN}"
 if [[ $EUID -ne 0 ]]; then
@@ -87,7 +103,7 @@ log_message "Root privileges confirmed." "${GREEN}"
 
 # Step 2: Check if required tools are installed
 log_message "Step 2: Checking for required tools..." "${GREEN}"
-for tool in dd genisoimage gzip mdadm pv lsof; do
+for tool in dd genisoimage gzip mdadm pv lsof mountpoint; do
     if ! command -v $tool &>/dev/null; then
         log_message "$tool is not installed. Please install it (e.g., 'apt install $tool')." "${RED}"
         exit 1
@@ -128,24 +144,29 @@ if [[ ! -w "$OUTPUT_DIR" ]]; then
 fi
 log_message "Output directory $OUTPUT_DIR is ready." "${GREEN}"
 
-# Step 5: Check if output directory is on the disk being backed up
-log_message "Step 5: Ensuring output directory is not on $DISK or /dev/sdb..." "${GREEN}"
+# Step 5: Check SSHFS mount integrity
+log_message "Step 5: Verifying SSHFS mount $OUTPUT_DIR..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR"
+log_message "SSHFS mount verified." "${GREEN}"
+
+# Step 6: Check if output directory is on the disk being backed up
+log_message "Step 6: Ensuring output directory is not on $DISK or /dev/sdb..." "${GREEN}"
 if df "$OUTPUT_DIR" | grep -qE "/dev/sda|/dev/sdb"; then
     log_message "Error: Output directory $OUTPUT_DIR is on $DISK or /dev/sdb. Choose a different disk (e.g., external drive)." "${RED}"
     exit 1
 fi
 log_message "Output directory is on a separate disk." "${GREEN}"
 
-# Step 6: Check if disk exists
-log_message "Step 6: Verifying disk $DISK exists..." "${GREEN}"
+# Step 7: Check if disk exists
+log_message "Step 7: Verifying disk $DISK exists..." "${GREEN}"
 if [[ ! -b "$DISK" ]]; then
     log_message "Disk $DISK does not exist. Exiting." "${RED}"
     exit 1
 fi
 log_message "Disk $DISK confirmed." "${GREEN}"
 
-# Step 7: Check if disk is mounted
-log_message "Step 7: Checking if $DISK is mounted..." "${GREEN}"
+# Step 8: Check if disk is mounted
+log_message "Step 8: Checking if $DISK is mounted..." "${GREEN}"
 if grep -qs "$DISK" "$MOUNT_CHECK"; then
     log_message "Warning: $DISK or its partitions are mounted. This may cause data corruption in the backup." "${YELLOW}"
     log_message "For a cleaner backup, boot from a live CD/USB (e.g., SystemRescueCD) or stop services and unmount partitions." "${YELLOW}"
@@ -157,8 +178,8 @@ if grep -qs "$DISK" "$MOUNT_CHECK"; then
 fi
 log_message "Disk mount check complete." "${GREEN}"
 
-# Step 8: Check for running services
-log_message "Step 8: Checking for active services..." "${GREEN}"
+# Step 9: Check for running services
+log_message "Step 9: Checking for active services..." "${GREEN}"
 if pgrep -x "mysql" >/dev/null || pgrep -x "postgres" >/dev/null || pgrep -x "apache2" >/dev/null || pgrep -x "nginx" >/dev/null; then
     log_message "Warning: Active services (e.g., databases, web servers) detected. This may lead to inconsistent backup." "${YELLOW}"
     log_message "Consider stopping services (e.g., 'systemctl stop mysql apache2') or using a live CD/USB." "${YELLOW}"
@@ -170,8 +191,8 @@ if pgrep -x "mysql" >/dev/null || pgrep -x "postgres" >/dev/null || pgrep -x "ap
 fi
 log_message "Service check complete." "${GREEN}"
 
-# Step 9: Check available space in output directory
-log_message "Step 9: Checking available space in $OUTPUT_DIR..." "${GREEN}"
+# Step 10: Check available space in output directory
+log_message "Step 10: Checking available space in $OUTPUT_DIR..." "${GREEN}"
 DISK_SIZE=$(lsblk -b --output SIZE -n -d "$DISK" | head -n 1)
 DISK_SIZE_GB=$((DISK_SIZE / 1024 / 1024 / 1024))
 REQUIRED_SPACE_GB=$((DISK_SIZE_GB + MIN_SPACE_GB))
@@ -181,15 +202,6 @@ if [[ "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE_GB" ]]; then
     exit 1
 fi
 log_message "Sufficient space available: ${AVAILABLE_SPACE}GB in $OUTPUT_DIR." "${GREEN}"
-
-# Step 10: Check available space in temporary directory
-log_message "Step 10: Checking available space in $TEMP_DIR..." "${GREEN}"
-TEMP_AVAILABLE=$(df -B1G "$TEMP_DIR" | tail -n 1 | awk '{print $4}')
-if [[ "$TEMP_AVAILABLE" -lt "$REQUIRED_SPACE_GB" ]]; then
-    log_message "Insufficient space in $TEMP_DIR. Need ${REQUIRED_SPACE_GB}GB, but only ${TEMP_AVAILABLE}GB available." "${RED}"
-    exit 1
-fi
-log_message "Sufficient space available: ${TEMP_AVAILABLE}GB in $TEMP_DIR." "${GREEN}"
 
 # Step 11: Check for existing raw image
 log_message "Step 11: Checking for existing raw image $OUTPUT_DIR/$RAW_IMAGE..." "${GREEN}"
@@ -209,6 +221,7 @@ fi
 log_message "Step 12: Checking for existing compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE..." "${GREEN}"
 if [[ -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" ]]; then
     log_message "Compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE exists. Verifying integrity..." "${YELLOW}"
+    check_sshfs_mount "$OUTPUT_DIR"
     if check_gzip_integrity "$OUTPUT_DIR/$COMPRESSED_IMAGE"; then
         log_message "Existing compressed image is valid. Checking size for ISO compatibility..." "${GREEN}"
         COMPRESSED_SIZE=$(stat -c %s "$OUTPUT_DIR/$COMPRESSED_IMAGE")
@@ -226,6 +239,7 @@ fi
 # Step 13: Create raw disk image (if needed)
 if [[ -z "$RAW_IMAGE_EXISTS" && -z "$COMPRESSION_SKIPPED" ]]; then
     log_message "Step 13: Creating raw disk image from $DISK..." "${GREEN}"
+    check_sshfs_mount "$OUTPUT_DIR"
     dd if="$DISK" of="$OUTPUT_DIR/$RAW_IMAGE" bs=4M status=progress || {
         log_message "Failed to create raw disk image." "${RED}"
         exit 1
@@ -238,6 +252,7 @@ fi
 # Step 14: Compress the raw image (if needed)
 if [[ -z "$COMPRESSION_SKIPPED" ]]; then
     log_message "Step 14: Compressing raw image to save space with progress bar..." "${GREEN}"
+    check_sshfs_mount "$OUTPUT_DIR"
     nice -n 10 pv "$OUTPUT_DIR/$RAW_IMAGE" | gzip > "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
         log_message "Failed to compress image." "${RED}"
         exit 1
@@ -247,26 +262,19 @@ else
     log_message "Step 14: Skipping compression due to valid existing compressed image." "${GREEN}"
 fi
 
-# Step 15: Copy compressed image to temporary directory
-log_message "Step 15: Copying compressed image to $TEMP_DIR to avoid SSHFS issues..." "${GREEN}"
+# Step 15: Create bootable ISO
+log_message "Step 15: Creating bootable UDF ISO image..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR"
 check_file_in_use "$OUTPUT_DIR/$COMPRESSED_IMAGE"
-cp "$OUTPUT_DIR/$COMPRESSED_IMAGE" "$TEMP_DIR/$COMPRESSED_IMAGE" || {
-    log_message "Failed to copy compressed image to $TEMP_DIR." "${RED}"
-    exit 1
-}
-log_message "Compressed image copied to $TEMP_DIR/$COMPRESSED_IMAGE." "${GREEN}"
-
-# Step 16: Create bootable ISO
-log_message "Step 16: Creating bootable UDF ISO image..." "${GREEN}"
-check_file_in_use "$TEMP_DIR/$COMPRESSED_IMAGE"
-genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -udf -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -allow-limited-size "$TEMP_DIR/$COMPRESSED_IMAGE" || {
+genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -udf -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -allow-limited-size "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
     log_message "Failed to create ISO image." "${RED}"
     exit 1
 }
 log_message "Bootable ISO image created successfully." "${GREEN}"
 
-# Step 17: Verify ISO integrity
-log_message "Step 17: Verifying ISO image..." "${GREEN}"
+# Step 16: Verify ISO integrity
+log_message "Step 16: Verifying ISO image..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR"
 if [[ -f "$OUTPUT_DIR/$ISO_NAME" ]]; then
     ISO_SIZE=$(stat -c %s "$OUTPUT_DIR/$ISO_NAME")
     if [[ "$ISO_SIZE" -gt 0 ]]; then
@@ -280,13 +288,13 @@ else
     exit 1
 fi
 
-# Step 18: Clean up temporary files
-log_message "Step 18: Cleaning up temporary files..." "${GREEN}"
-rm -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" "$TEMP_DIR/$COMPRESSED_IMAGE" || log_message "Warning: Failed to remove temporary file(s)." "${YELLOW}"
+# Step 17: Clean up temporary files
+log_message "Step 17: Cleaning up temporary files..." "${GREEN}"
+rm -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" || log_message "Warning: Failed to remove temporary file $COMPRESSED_IMAGE." "${YELLOW}"
 log_message "Temporary files cleaned up." "${GREEN}"
 
-# Step 19: Finalize
-log_message "Step 19: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GREEN}"
+# Step 18: Finalize
+log_message "Step 18: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GREEN}"
 log_message "Next steps:" "${YELLOW}"
 log_message "1. Test the ISO in a virtual machine (e.g., VirtualBox, QEMU) to ensure it boots correctly." "${YELLOW}"
 log_message "2. Store the ISO securely, preferably encrypted (e.g., 'gpg -c $ISO_NAME')." "${YELLOW}"
