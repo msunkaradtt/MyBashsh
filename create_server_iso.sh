@@ -14,6 +14,7 @@ NC='\033[0m' # No Color
 # Configuration (adjust these as needed)
 DISK="/dev/sda" # Disk to backup (RAID1 member)
 OUTPUT_DIR="/mnt/localdisk" # Directory to store the ISO (must not be on /dev/sda or /dev/sdb)
+TEMP_DIR="/tmp" # Temporary directory for local file operations
 ISO_NAME="server_backup_$(date +%Y%m%d_%H%M%S).iso"
 RAW_IMAGE="raw_backup.img"
 COMPRESSED_IMAGE="raw_backup.img.gz"
@@ -63,6 +64,19 @@ check_raw_image_size() {
     fi
 }
 
+# Function to check if file is in use
+check_file_in_use() {
+    local file="$1"
+    if command -v lsof >/dev/null; then
+        if lsof "$file" >/dev/null 2>&1; then
+            log_message "Error: File $file is in use by another process. Exiting." "${RED}"
+            exit 1
+        fi
+    else
+        log_message "Warning: lsof not installed. Cannot check if $file is in use. Proceeding with caution." "${YELLOW}"
+    fi
+}
+
 # Step 1: Check if running as root
 log_message "Step 1: Verifying root privileges..." "${GREEN}"
 if [[ $EUID -ne 0 ]]; then
@@ -73,7 +87,7 @@ log_message "Root privileges confirmed." "${GREEN}"
 
 # Step 2: Check if required tools are installed
 log_message "Step 2: Checking for required tools..." "${GREEN}"
-for tool in dd genisoimage gzip mdadm pv; do
+for tool in dd genisoimage gzip mdadm pv lsof; do
     if ! command -v $tool &>/dev/null; then
         log_message "$tool is not installed. Please install it (e.g., 'apt install $tool')." "${RED}"
         exit 1
@@ -168,8 +182,17 @@ if [[ "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE_GB" ]]; then
 fi
 log_message "Sufficient space available: ${AVAILABLE_SPACE}GB in $OUTPUT_DIR." "${GREEN}"
 
-# Step 10: Check for existing raw image
-log_message "Step 10: Checking for existing raw image $OUTPUT_DIR/$RAW_IMAGE..." "${GREEN}"
+# Step 10: Check available space in temporary directory
+log_message "Step 10: Checking available space in $TEMP_DIR..." "${GREEN}"
+TEMP_AVAILABLE=$(df -B1G "$TEMP_DIR" | tail -n 1 | awk '{print $4}')
+if [[ "$TEMP_AVAILABLE" -lt "$REQUIRED_SPACE_GB" ]]; then
+    log_message "Insufficient space in $TEMP_DIR. Need ${REQUIRED_SPACE_GB}GB, but only ${TEMP_AVAILABLE}GB available." "${RED}"
+    exit 1
+fi
+log_message "Sufficient space available: ${TEMP_AVAILABLE}GB in $TEMP_DIR." "${GREEN}"
+
+# Step 11: Check for existing raw image
+log_message "Step 11: Checking for existing raw image $OUTPUT_DIR/$RAW_IMAGE..." "${GREEN}"
 if [[ -f "$OUTPUT_DIR/$RAW_IMAGE" ]]; then
     log_message "Raw image $OUTPUT_DIR/$RAW_IMAGE exists. Verifying size..." "${YELLOW}"
     if check_raw_image_size "$OUTPUT_DIR/$RAW_IMAGE"; then
@@ -182,15 +205,15 @@ else
     log_message "No existing raw image found." "${GREEN}"
 fi
 
-# Step 11: Check for existing compressed image and verify integrity
-log_message "Step 11: Checking for existing compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE..." "${GREEN}"
+# Step 12: Check for existing compressed image and verify integrity
+log_message "Step 12: Checking for existing compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE..." "${GREEN}"
 if [[ -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" ]]; then
     log_message "Compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE exists. Verifying integrity..." "${YELLOW}"
     if check_gzip_integrity "$OUTPUT_DIR/$COMPRESSED_IMAGE"; then
         log_message "Existing compressed image is valid. Checking size for ISO compatibility..." "${GREEN}"
         COMPRESSED_SIZE=$(stat -c %s "$OUTPUT_DIR/$COMPRESSED_IMAGE")
         if [[ "$COMPRESSED_SIZE" -gt "$MAX_ISO_FILE_SIZE" ]]; then
-            log_message "Warning: Compressed image ($COMPRESSED_SIZE bytes) exceeds 4GiB. Using -allow-limited-size for ISO creation." "${YELLOW}"
+            log_message "Warning: Compressed image ($COMPRESSED_SIZE bytes) exceeds 4GiB. Creating UDF-based ISO." "${YELLOW}"
         fi
         COMPRESSION_SKIPPED=1
     else
@@ -200,40 +223,50 @@ else
     log_message "No existing compressed image found." "${GREEN}"
 fi
 
-# Step 12: Create raw disk image (if needed)
+# Step 13: Create raw disk image (if needed)
 if [[ -z "$RAW_IMAGE_EXISTS" && -z "$COMPRESSION_SKIPPED" ]]; then
-    log_message "Step 12: Creating raw disk image from $DISK..." "${GREEN}"
+    log_message "Step 13: Creating raw disk image from $DISK..." "${GREEN}"
     dd if="$DISK" of="$OUTPUT_DIR/$RAW_IMAGE" bs=4M status=progress || {
         log_message "Failed to create raw disk image." "${RED}"
         exit 1
     }
     log_message "Raw disk image created successfully." "${GREEN}"
 else
-    log_message "Step 12: Skipping raw image creation due to valid existing raw or compressed image." "${GREEN}"
+    log_message "Step 13: Skipping raw image creation due to valid existing raw or compressed image." "${GREEN}"
 fi
 
-# Step 13: Compress the raw image (if needed)
+# Step 14: Compress the raw image (if needed)
 if [[ -z "$COMPRESSION_SKIPPED" ]]; then
-    log_message "Step 13: Compressing raw image to save space with progress bar..." "${GREEN}"
+    log_message "Step 14: Compressing raw image to save space with progress bar..." "${GREEN}"
     nice -n 10 pv "$OUTPUT_DIR/$RAW_IMAGE" | gzip > "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
         log_message "Failed to compress image." "${RED}"
         exit 1
     }
     log_message "Raw image compressed successfully to $OUTPUT_DIR/$COMPRESSED_IMAGE." "${GREEN}"
 else
-    log_message "Step 13: Skipping compression due to valid existing compressed image." "${GREEN}"
+    log_message "Step 14: Skipping compression due to valid existing compressed image." "${GREEN}"
 fi
 
-# Step 14: Create bootable ISO
-log_message "Step 14: Creating bootable ISO image..." "${GREEN}"
-genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -allow-limited-size "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
+# Step 15: Copy compressed image to temporary directory
+log_message "Step 15: Copying compressed image to $TEMP_DIR to avoid SSHFS issues..." "${GREEN}"
+check_file_in_use "$OUTPUT_DIR/$COMPRESSED_IMAGE"
+cp "$OUTPUT_DIR/$COMPRESSED_IMAGE" "$TEMP_DIR/$COMPRESSED_IMAGE" || {
+    log_message "Failed to copy compressed image to $TEMP_DIR." "${RED}"
+    exit 1
+}
+log_message "Compressed image copied to $TEMP_DIR/$COMPRESSED_IMAGE." "${GREEN}"
+
+# Step 16: Create bootable ISO
+log_message "Step 16: Creating bootable UDF ISO image..." "${GREEN}"
+check_file_in_use "$TEMP_DIR/$COMPRESSED_IMAGE"
+genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -udf -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -allow-limited-size "$TEMP_DIR/$COMPRESSED_IMAGE" || {
     log_message "Failed to create ISO image." "${RED}"
     exit 1
 }
 log_message "Bootable ISO image created successfully." "${GREEN}"
 
-# Step 15: Verify ISO integrity
-log_message "Step 15: Verifying ISO image..." "${GREEN}"
+# Step 17: Verify ISO integrity
+log_message "Step 17: Verifying ISO image..." "${GREEN}"
 if [[ -f "$OUTPUT_DIR/$ISO_NAME" ]]; then
     ISO_SIZE=$(stat -c %s "$OUTPUT_DIR/$ISO_NAME")
     if [[ "$ISO_SIZE" -gt 0 ]]; then
@@ -247,13 +280,13 @@ else
     exit 1
 fi
 
-# Step 16: Clean up temporary files
-log_message "Step 16: Cleaning up temporary files..." "${GREEN}"
-rm -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" || log_message "Warning: Failed to remove temporary file $COMPRESSED_IMAGE." "${YELLOW}"
+# Step 18: Clean up temporary files
+log_message "Step 18: Cleaning up temporary files..." "${GREEN}"
+rm -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" "$TEMP_DIR/$COMPRESSED_IMAGE" || log_message "Warning: Failed to remove temporary file(s)." "${YELLOW}"
 log_message "Temporary files cleaned up." "${GREEN}"
 
-# Step 17: Finalize
-log_message "Step 17: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GREEN}"
+# Step 19: Finalize
+log_message "Step 19: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GREEN}"
 log_message "Next steps:" "${YELLOW}"
 log_message "1. Test the ISO in a virtual machine (e.g., VirtualBox, QEMU) to ensure it boots correctly." "${YELLOW}"
 log_message "2. Store the ISO securely, preferably encrypted (e.g., 'gpg -c $ISO_NAME')." "${YELLOW}"
