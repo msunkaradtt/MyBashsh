@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script to create a bootable ISO image of a Linux server with RAID1 and safety checks
+# Script to create a bootable ISO image of a Linux server with RAID1, backing up only used data
 
 # Exit on any error
 set -e
@@ -12,14 +12,16 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Configuration (adjust these as needed)
-DISK="/dev/sda" # Disk to backup (RAID1 member)
+DISK="/dev/sda" # Disk to verify RAID1 (not directly backed up)
+MD_DEVICES=("/dev/md0" "/dev/md1" "/dev/md2") # RAID1 devices (swap, /boot, /)
 OUTPUT_DIR="/mnt/localdisk" # Directory to store the ISO (must not be on /dev/sda or /dev/sdb)
 ISO_NAME="server_backup_$(date +%Y%m%d_%H%M%S).iso"
-RAW_IMAGE="raw_backup.img"
-COMPRESSED_IMAGE="raw_backup.img.gz"
+BACKUP_DIR="backup_$(date +%Y%m%d_%H%M%S)"
+COMPRESSED_IMAGE="backup.tar.gz"
 MIN_SPACE_GB=10 # Minimum free space required in GB
 MOUNT_CHECK="/proc/mounts"
 MAX_ISO_FILE_SIZE=$((4 * 1024 * 1024 * 1024)) # 4GiB limit for ISO files
+SSHFS_RETRIES=3 # Number of retries for SSHFS mount
 
 # Function to log messages
 log_message() {
@@ -48,21 +50,6 @@ check_gzip_integrity() {
     return 1
 }
 
-# Function to check raw image size
-check_raw_image_size() {
-    local raw_file="$1"
-    local disk_size=$(lsblk -b --output SIZE -n -d "$DISK" | head -n 1)
-    local raw_size=$(stat -c %s "$raw_file" 2>/dev/null || echo 0)
-    if [[ "$raw_size" -eq "$disk_size" ]]; then
-        log_message "Raw image $raw_file matches disk size ($disk_size bytes). Proceeding with compression." "${GREEN}"
-        return 0
-    else
-        log_message "Raw image $raw_file size ($raw_size bytes) does not match disk size ($disk_size bytes). Recreating raw image." "${YELLOW}"
-        rm -f "$raw_file"
-        return 1
-    fi
-}
-
 # Function to check if file is in use
 check_file_in_use() {
     local file="$1"
@@ -76,21 +63,37 @@ check_file_in_use() {
     fi
 }
 
-# Function to check SSHFS mount integrity
+# Function to check SSHFS mount integrity with retries
 check_sshfs_mount() {
     local mount_point="$1"
-    if ! mountpoint -q "$mount_point"; then
-        log_message "Error: $mount_point is not a valid mount point. Exiting." "${RED}"
-        exit 1
-    fi
-    # Test write to ensure mount is functional
-    local test_file="$mount_point/.test_$(date +%s)"
-    if ! touch "$test_file" 2>/dev/null; then
-        log_message "Error: Cannot write to $mount_point. SSHFS mount may be broken. Exiting." "${RED}"
-        exit 1
-    fi
-    rm -f "$test_file"
-    log_message "$mount_point is mounted and writable." "${GREEN}"
+    local retries=$2
+    local attempt=1
+    while [[ $attempt -le $retries ]]; do
+        if mountpoint -q "$mount_point"; then
+            # Test write to ensure mount is functional
+            local test_file="$mount_point/.test_$(date +%s)"
+            if touch "$test_file" 2>/dev/null; then
+                rm -f "$test_file"
+                log_message "$mount_point is mounted and writable." "${GREEN}"
+                return 0
+            else
+                log_message "Attempt $attempt/$retries: Cannot write to $mount_point. SSHFS mount may be broken." "${YELLOW}"
+            fi
+        else
+            log_message "Attempt $attempt/$retries: $mount_point is not a valid mount point." "${YELLOW}"
+        fi
+        if [[ $attempt -lt $retries ]]; then
+            log_message "Retrying SSHFS mount..." "${YELLOW}"
+            umount "$mount_point" 2>/dev/null || true
+            sshfs msunkaradtt@localhost:/mnt/f/backup "$mount_point" -p 2222 -o allow_other,ServerAliveInterval=60,ServerAliveCountMax=3 || {
+                log_message "Failed to remount $mount_point." "${RED}"
+            }
+            sleep 5
+        fi
+        ((attempt++))
+    done
+    log_message "Error: Failed to verify $mount_point after $retries attempts. Exiting." "${RED}"
+    exit 1
 }
 
 # Step 1: Check if running as root
@@ -103,9 +106,9 @@ log_message "Root privileges confirmed." "${GREEN}"
 
 # Step 2: Check if required tools are installed
 log_message "Step 2: Checking for required tools..." "${GREEN}"
-for tool in dd genisoimage gzip mdadm pv lsof mountpoint; do
+for tool in partclone.ext4 partclone.swap tar genisoimage gzip mdadm pv lsof mountpoint; do
     if ! command -v $tool &>/dev/null; then
-        log_message "$tool is not installed. Please install it (e.g., 'apt install $tool')." "${RED}"
+        log_message "$tool is not installed. Please install it (e.g., 'apt install partclone tar genisoimage gzip mdadm pv lsof util-linux')." "${RED}"
         exit 1
     fi
 done
@@ -125,7 +128,8 @@ if [[ -f /proc/mdstat ]]; then
         fi
     fi
 else
-    log_message "RAID not detected. Is this a RAID system?" "${YELLOW}"
+    log_message "RAID not detected. Is this a RAID system?" "${RED}"
+    exit 1
 fi
 log_message "RAID status check complete." "${GREEN}"
 
@@ -146,7 +150,7 @@ log_message "Output directory $OUTPUT_DIR is ready." "${GREEN}"
 
 # Step 5: Check SSHFS mount integrity
 log_message "Step 5: Verifying SSHFS mount $OUTPUT_DIR..." "${GREEN}"
-check_sshfs_mount "$OUTPUT_DIR"
+check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
 log_message "SSHFS mount verified." "${GREEN}"
 
 # Step 6: Check if output directory is on the disk being backed up
@@ -157,26 +161,30 @@ if df "$OUTPUT_DIR" | grep -qE "/dev/sda|/dev/sdb"; then
 fi
 log_message "Output directory is on a separate disk." "${GREEN}"
 
-# Step 7: Check if disk exists
-log_message "Step 7: Verifying disk $DISK exists..." "${GREEN}"
-if [[ ! -b "$DISK" ]]; then
-    log_message "Disk $DISK does not exist. Exiting." "${RED}"
-    exit 1
-fi
-log_message "Disk $DISK confirmed." "${GREEN}"
-
-# Step 8: Check if disk is mounted
-log_message "Step 8: Checking if $DISK is mounted..." "${GREEN}"
-if grep -qs "$DISK" "$MOUNT_CHECK"; then
-    log_message "Warning: $DISK or its partitions are mounted. This may cause data corruption in the backup." "${YELLOW}"
-    log_message "For a cleaner backup, boot from a live CD/USB (e.g., SystemRescueCD) or stop services and unmount partitions." "${YELLOW}"
-    read -p "Continue anyway? (y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        log_message "Aborting at user request." "${RED}"
+# Step 7: Check if RAID devices exist
+log_message "Step 7: Verifying RAID devices exist..." "${GREEN}"
+for md in "${MD_DEVICES[@]}"; do
+    if [[ ! -b "$md" ]]; then
+        log_message "RAID device $md does not exist. Exiting." "${RED}"
         exit 1
     fi
-fi
-log_message "Disk mount check complete." "${GREEN}"
+done
+log_message "All RAID devices confirmed." "${GREEN}"
+
+# Step 8: Check if RAID devices are mounted
+log_message "Step 8: Checking if RAID devices are mounted..." "${GREEN}"
+for md in "${MD_DEVICES[@]}"; do
+    if grep -qs "$md" "$MOUNT_CHECK"; then
+        log_message "Warning: $md is mounted. This may cause data corruption in the backup." "${YELLOW}"
+        log_message "For a cleaner backup, boot from a live CD/USB (e.g., SystemRescueCD) or stop services and unmount partitions." "${YELLOW}"
+        read -p "Continue anyway? (y/N): " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            log_message "Aborting at user request." "${RED}"
+            exit 1
+        fi
+    fi
+done
+log_message "RAID device mount check complete." "${GREEN}"
 
 # Step 9: Check for running services
 log_message "Step 9: Checking for active services..." "${GREEN}"
@@ -193,78 +201,92 @@ log_message "Service check complete." "${GREEN}"
 
 # Step 10: Check available space in output directory
 log_message "Step 10: Checking available space in $OUTPUT_DIR..." "${GREEN}"
-DISK_SIZE=$(lsblk -b --output SIZE -n -d "$DISK" | head -n 1)
-DISK_SIZE_GB=$((DISK_SIZE / 1024 / 1024 / 1024))
-REQUIRED_SPACE_GB=$((DISK_SIZE_GB + MIN_SPACE_GB))
+# Estimate required space based on used space in filesystems
+USED_SPACE=0
+for md in "${MD_DEVICES[@]}"; do
+    if [[ "$md" == "/dev/md0" ]]; then
+        # Swap: Estimate small size for metadata
+        USED_SPACE=$((USED_SPACE + 1)) # Assume 1GB for swap
+    else
+        # Get used space for ext4 filesystems
+        USED_SPACE=$((USED_SPACE + $(df -B1G "$md" | tail -n 1 | awk '{print $3}' 2>/dev/null || echo 0)))
+    fi
+done
+REQUIRED_SPACE_GB=$((USED_SPACE + MIN_SPACE_GB))
 AVAILABLE_SPACE=$(df -B1G "$OUTPUT_DIR" | tail -n 1 | awk '{print $4}')
 if [[ "$AVAILABLE_SPACE" -lt "$REQUIRED_SPACE_GB" ]]; then
     log_message "Insufficient space in $OUTPUT_DIR. Need ${REQUIRED_SPACE_GB}GB, but only ${AVAILABLE_SPACE}GB available." "${RED}"
     exit 1
 fi
-log_message "Sufficient space available: ${AVAILABLE_SPACE}GB in $OUTPUT_DIR." "${GREEN}"
+log_message "Sufficient space available: ${AVAILABLE_SPACE}GB in $OUTPUT_DIR for estimated ${REQUIRED_SPACE_GB}GB." "${GREEN}"
 
-# Step 11: Check for existing raw image
-log_message "Step 11: Checking for existing raw image $OUTPUT_DIR/$RAW_IMAGE..." "${GREEN}"
-if [[ -f "$OUTPUT_DIR/$RAW_IMAGE" ]]; then
-    log_message "Raw image $OUTPUT_DIR/$RAW_IMAGE exists. Verifying size..." "${YELLOW}"
-    if check_raw_image_size "$OUTPUT_DIR/$RAW_IMAGE"; then
-        log_message "Existing raw image is valid. Skipping raw image creation." "${GREEN}"
-        RAW_IMAGE_EXISTS=1
+# Step 11: Create backup directory
+log_message "Step 11: Creating backup directory $OUTPUT_DIR/$BACKUP_DIR..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
+mkdir -p "$OUTPUT_DIR/$BACKUP_DIR" || {
+    log_message "Failed to create $OUTPUT_DIR/$BACKUP_DIR. Exiting." "${RED}"
+    exit 1
+}
+log_message "Backup directory created." "${GREEN}"
+
+# Step 12: Backup RAID metadata
+log_message "Step 12: Backing up RAID metadata..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
+mdadm --detail --scan > "$OUTPUT_DIR/$BACKUP_DIR/mdadm.conf" || {
+    log_message "Failed to save RAID metadata." "${RED}"
+    exit 1
+}
+log_message "RAID metadata saved to $OUTPUT_DIR/$BACKUP_DIR/mdadm.conf." "${GREEN}"
+
+# Step 13: Backup filesystems with partclone
+log_message "Step 13: Backing up filesystems with partclone..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
+for md in "${MD_DEVICES[@]}"; do
+    log_message "Processing $md..." "${GREEN}"
+    if [[ "$md" == "/dev/md0" ]]; then
+        # Backup swap
+        partclone.swap -c -s "$md" -o "$OUTPUT_DIR/$BACKUP_DIR/$(basename $md).img" | pv -s 1G || {
+            log_message "Failed to backup swap $md." "${RED}"
+            exit 1
+        }
     else
-        log_message "Existing raw image is invalid. Will recreate it." "${YELLOW}"
+        # Backup ext4 filesystem
+        partclone.ext4 -c -s "$md" -o "$OUTPUT_DIR/$BACKUP_DIR/$(basename $md).img" | pv || {
+            log_message "Failed to backup filesystem $md." "${RED}"
+            exit 1
+        }
+    fi
+    log_message "Backup of $md completed." "${GREEN}"
+done
+log_message "All filesystems backed up." "${GREEN}"
+
+# Step 14: Compress backup directory
+log_message "Step 14: Compressing backup directory to $OUTPUT_DIR/$COMPRESSED_IMAGE..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
+check_file_in_use "$OUTPUT_DIR/$BACKUP_DIR"
+nice -n 10 tar -C "$OUTPUT_DIR" -czf "$OUTPUT_DIR/$COMPRESSED_IMAGE" "$BACKUP_DIR" | pv || {
+    log_message "Failed to compress backup directory." "${RED}"
+    exit 1
+}
+log_message "Backup directory compressed successfully." "${GREEN}"
+
+# Step 15: Verify compressed image
+log_message "Step 15: Verifying compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
+if check_gzip_integrity "$OUTPUT_DIR/$COMPRESSED_IMAGE"; then
+    COMPRESSED_SIZE=$(stat -c %s "$OUTPUT_DIR/$COMPRESSED_IMAGE")
+    if [[ "$COMPRESSED_SIZE" -gt "$MAX_ISO_FILE_SIZE" ]]; then
+        log_message "Warning: Compressed image ($COMPRESSED_SIZE bytes) exceeds 4GiB. Creating UDF-based ISO." "${YELLOW}"
     fi
 else
-    log_message "No existing raw image found." "${GREEN}"
+    log_message "Compressed image verification failed. Exiting." "${RED}"
+    exit 1
 fi
+log_message "Compressed image verified." "${GREEN}"
 
-# Step 12: Check for existing compressed image and verify integrity
-log_message "Step 12: Checking for existing compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE..." "${GREEN}"
-if [[ -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" ]]; then
-    log_message "Compressed image $OUTPUT_DIR/$COMPRESSED_IMAGE exists. Verifying integrity..." "${YELLOW}"
-    check_sshfs_mount "$OUTPUT_DIR"
-    if check_gzip_integrity "$OUTPUT_DIR/$COMPRESSED_IMAGE"; then
-        log_message "Existing compressed image is valid. Checking size for ISO compatibility..." "${GREEN}"
-        COMPRESSED_SIZE=$(stat -c %s "$OUTPUT_DIR/$COMPRESSED_IMAGE")
-        if [[ "$COMPRESSED_SIZE" -gt "$MAX_ISO_FILE_SIZE" ]]; then
-            log_message "Warning: Compressed image ($COMPRESSED_SIZE bytes) exceeds 4GiB. Creating UDF-based ISO." "${YELLOW}"
-        fi
-        COMPRESSION_SKIPPED=1
-    else
-        log_message "Removing incomplete compressed image and restarting compression." "${YELLOW}"
-    fi
-else
-    log_message "No existing compressed image found." "${GREEN}"
-fi
-
-# Step 13: Create raw disk image (if needed)
-if [[ -z "$RAW_IMAGE_EXISTS" && -z "$COMPRESSION_SKIPPED" ]]; then
-    log_message "Step 13: Creating raw disk image from $DISK..." "${GREEN}"
-    check_sshfs_mount "$OUTPUT_DIR"
-    dd if="$DISK" of="$OUTPUT_DIR/$RAW_IMAGE" bs=4M status=progress || {
-        log_message "Failed to create raw disk image." "${RED}"
-        exit 1
-    }
-    log_message "Raw disk image created successfully." "${GREEN}"
-else
-    log_message "Step 13: Skipping raw image creation due to valid existing raw or compressed image." "${GREEN}"
-fi
-
-# Step 14: Compress the raw image (if needed)
-if [[ -z "$COMPRESSION_SKIPPED" ]]; then
-    log_message "Step 14: Compressing raw image to save space with progress bar..." "${GREEN}"
-    check_sshfs_mount "$OUTPUT_DIR"
-    nice -n 10 pv "$OUTPUT_DIR/$RAW_IMAGE" | gzip > "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
-        log_message "Failed to compress image." "${RED}"
-        exit 1
-    }
-    log_message "Raw image compressed successfully to $OUTPUT_DIR/$COMPRESSED_IMAGE." "${GREEN}"
-else
-    log_message "Step 14: Skipping compression due to valid existing compressed image." "${GREEN}"
-fi
-
-# Step 15: Create bootable ISO
-log_message "Step 15: Creating bootable UDF ISO image..." "${GREEN}"
-check_sshfs_mount "$OUTPUT_DIR"
+# Step 16: Create bootable ISO
+log_message "Step 16: Creating bootable UDF ISO image..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
 check_file_in_use "$OUTPUT_DIR/$COMPRESSED_IMAGE"
 genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -udf -b "$COMPRESSED_IMAGE" -c boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -allow-limited-size "$OUTPUT_DIR/$COMPRESSED_IMAGE" || {
     log_message "Failed to create ISO image." "${RED}"
@@ -272,9 +294,9 @@ genisoimage -o "$OUTPUT_DIR/$ISO_NAME" -udf -b "$COMPRESSED_IMAGE" -c boot.cat -
 }
 log_message "Bootable ISO image created successfully." "${GREEN}"
 
-# Step 16: Verify ISO integrity
-log_message "Step 16: Verifying ISO image..." "${GREEN}"
-check_sshfs_mount "$OUTPUT_DIR"
+# Step 17: Verify ISO integrity
+log_message "Step 17: Verifying ISO image..." "${GREEN}"
+check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
 if [[ -f "$OUTPUT_DIR/$ISO_NAME" ]]; then
     ISO_SIZE=$(stat -c %s "$OUTPUT_DIR/$ISO_NAME")
     if [[ "$ISO_SIZE" -gt 0 ]]; then
@@ -288,17 +310,21 @@ else
     exit 1
 fi
 
-# Step 17: Clean up temporary files
-log_message "Step 17: Cleaning up temporary files..." "${GREEN}"
-rm -f "$OUTPUT_DIR/$COMPRESSED_IMAGE" || log_message "Warning: Failed to remove temporary file $COMPRESSED_IMAGE." "${YELLOW}"
+# Step 18: Clean up temporary files
+log_message "Step 18: Cleaning up temporary files..." "${GREEN}"
+rm -rf "$OUTPUT_DIR/$BACKUP_DIR" "$OUTPUT_DIR/$COMPRESSED_IMAGE" || log_message "Warning: Failed to remove temporary file(s)." "${YELLOW}"
 log_message "Temporary files cleaned up." "${GREEN}"
 
-# Step 18: Finalize
-log_message "Step 18: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GREEN}"
+# Step 19: Finalize
+log_message "Step 19: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GREEN}"
 log_message "Next steps:" "${YELLOW}"
 log_message "1. Test the ISO in a virtual machine (e.g., VirtualBox, QEMU) to ensure it boots correctly." "${YELLOW}"
 log_message "2. Store the ISO securely, preferably encrypted (e.g., 'gpg -c $ISO_NAME')." "${YELLOW}"
-log_message "3. To restore, boot from the ISO and use 'dd' to write it back to a disk. Rebuild RAID1 using 'mdadm' if needed." "${YELLOW}"
-log_message "4. Note: Restoring to a single disk will include RAID metadata. To restore RAID1, ensure both disks are configured with 'mdadm'." "${YELLOW}"
+log_message "3. To restore, boot from a live CD/USB (e.g., SystemRescueCD), extract the tar.gz, restore filesystems with 'partclone', and rebuild RAID1 with 'mdadm'." "${YELLOW}"
+log_message "4. Example restoration commands:" "${YELLOW}"
+log_message "   - Extract: tar -xzf /path/to/backup.tar.gz" "${YELLOW}"
+log_message "   - Restore swap: partclone.swap -r -s backup/md0.img -o /dev/md0" "${YELLOW}"
+log_message "   - Restore ext4: partclone.ext4 -r -s backup/md1.img -o /dev/md1" "${YELLOW}"
+log_message "   - Rebuild RAID: mdadm --create /dev/md0 --level=1 --raid-devices=2 /dev/sda1 /dev/sdb1" "${YELLOW}"
 
 exit 0
