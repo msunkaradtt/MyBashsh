@@ -96,6 +96,17 @@ check_sshfs_mount() {
     exit 1
 }
 
+# Function to remount /boot
+remount_boot() {
+    local mount_point="/boot"
+    if grep -qs "$mount_point" "$MOUNT_CHECK"; then
+        log_message "Remounting $mount_point..." "${GREEN}"
+        mount "$mount_point" || {
+            log_message "Warning: Failed to remount $mount_point. You may need to remount it manually." "${YELLOW}"
+        }
+    fi
+}
+
 # Step 1: Check if running as root
 log_message "Step 1: Verifying root privileges..." "${GREEN}"
 if [[ $EUID -ne 0 ]]; then
@@ -171,16 +182,33 @@ for md in "${MD_DEVICES[@]}"; do
 done
 log_message "All RAID devices confirmed." "${GREEN}"
 
-# Step 8: Check if RAID devices are mounted
+# Step 8: Check if RAID devices are mounted and handle /boot
 log_message "Step 8: Checking if RAID devices are mounted..." "${GREEN}"
+BOOT_WAS_MOUNTED=0
 for md in "${MD_DEVICES[@]}"; do
     if grep -qs "$md" "$MOUNT_CHECK"; then
-        log_message "Warning: $md is mounted. This may cause data corruption in the backup." "${YELLOW}"
-        log_message "For a cleaner backup, boot from a live CD/USB (e.g., SystemRescueCD) or stop services and unmount partitions." "${YELLOW}"
-        read -p "Continue anyway? (y/N): " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            log_message "Aborting at user request." "${RED}"
-            exit 1
+        if [[ "$md" == "/dev/md1" ]]; then
+            log_message "Warning: $md (/boot) is mounted. This may cause data corruption in the backup." "${YELLOW}"
+            log_message "For a cleaner backup, we can unmount /boot temporarily or use a live CD/USB (e.g., SystemRescueCD)." "${YELLOW}"
+            read -p "Unmount /boot and proceed? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                BOOT_WAS_MOUNTED=1
+                umount /boot || {
+                    log_message "Failed to unmount /boot. Exiting." "${RED}"
+                    exit 1
+                }
+                log_message "/boot unmounted successfully." "${GREEN}"
+            else
+                log_message "Continuing with /boot mounted, but backup may be inconsistent." "${YELLOW}"
+            fi
+        else
+            log_message "Warning: $md is mounted (likely /). This may cause data corruption in the backup." "${YELLOW}"
+            log_message "For a cleaner backup, boot from a live CD/USB (e.g., SystemRescueCD) or stop services." "${YELLOW}"
+            read -p "Continue anyway? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                log_message "Aborting at user request." "${RED}"
+                exit 1
+            fi
         fi
     fi
 done
@@ -300,8 +328,17 @@ log_message "Step 18: Cleaning up temporary files..." "${GREEN}"
 rm -rf "$OUTPUT_DIR/$BACKUP_DIR" "$OUTPUT_DIR/$COMPRESSED_IMAGE" || log_message "Warning: Failed to remove temporary file(s)." "${YELLOW}"
 log_message "Temporary files cleaned up." "${GREEN}"
 
-# Step 19: Finalize
-log_message "Step 19: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GREEN}"
+# Step 19: Remount /boot if it was unmounted
+if [[ "$BOOT_WAS_MOUNTED" -eq 1 ]]; then
+    log_message "Step 19: Remounting /boot..." "${GREEN}"
+    remount_boot
+    log_message "/boot remounted successfully." "${GREEN}"
+else
+    log_message "Step 19: No need to remount /boot." "${GREEN}"
+fi
+
+# Step 20: Finalize
+log_message "Step 20: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GREEN}"
 log_message "Next steps:" "${YELLOW}"
 log_message "1. Test the ISO in a virtual machine (e.g., VirtualBox, QEMU) to ensure it boots correctly." "${YELLOW}"
 log_message "2. Store the ISO securely, preferably encrypted (e.g., 'gpg -c $ISO_NAME')." "${YELLOW}"
