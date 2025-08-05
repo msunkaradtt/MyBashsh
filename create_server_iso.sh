@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script to create a bootable ISO image of a Linux server with RAID1, backing up only used data
+# Script to create a bootable ISO image of a Linux server with RAID1, backing up only used data (excluding swap)
 
 # Exit on any error
 set -e
@@ -13,7 +13,7 @@ NC='\033[0m' # No Color
 
 # Configuration (adjust these as needed)
 DISK="/dev/sda" # Disk to verify RAID1 (not directly backed up)
-MD_DEVICES=("/dev/md0" "/dev/md1" "/dev/md2") # RAID1 devices (swap, /boot, /)
+MD_DEVICES=("/dev/md1" "/dev/md2") # RAID1 devices (/boot, /)
 OUTPUT_DIR="/mnt/localdisk" # Directory to store the ISO (must not be on /dev/sda or /dev/sdb)
 ISO_NAME="server_backup_$(date +%Y%m%d_%H%M%S).iso"
 BACKUP_DIR="backup_$(date +%Y%m%d_%H%M%S)"
@@ -106,7 +106,7 @@ log_message "Root privileges confirmed." "${GREEN}"
 
 # Step 2: Check if required tools are installed
 log_message "Step 2: Checking for required tools..." "${GREEN}"
-for tool in partclone.ext4 partclone.swap tar genisoimage gzip mdadm pv lsof mountpoint; do
+for tool in partclone.ext4 tar genisoimage gzip mdadm pv lsof mountpoint; do
     if ! command -v $tool &>/dev/null; then
         log_message "$tool is not installed. Please install it (e.g., 'apt install partclone tar genisoimage gzip mdadm pv lsof util-linux')." "${RED}"
         exit 1
@@ -204,13 +204,7 @@ log_message "Step 10: Checking available space in $OUTPUT_DIR..." "${GREEN}"
 # Estimate required space based on used space in filesystems
 USED_SPACE=0
 for md in "${MD_DEVICES[@]}"; do
-    if [[ "$md" == "/dev/md0" ]]; then
-        # Swap: Estimate small size for metadata
-        USED_SPACE=$((USED_SPACE + 1)) # Assume 1GB for swap
-    else
-        # Get used space for ext4 filesystems
-        USED_SPACE=$((USED_SPACE + $(df -B1G "$md" | tail -n 1 | awk '{print $3}' 2>/dev/null || echo 0)))
-    fi
+    USED_SPACE=$((USED_SPACE + $(df -B1G "$md" | tail -n 1 | awk '{print $3}' 2>/dev/null || echo 0)))
 done
 REQUIRED_SPACE_GB=$((USED_SPACE + MIN_SPACE_GB))
 AVAILABLE_SPACE=$(df -B1G "$OUTPUT_DIR" | tail -n 1 | awk '{print $4}')
@@ -243,19 +237,10 @@ log_message "Step 13: Backing up filesystems with partclone..." "${GREEN}"
 check_sshfs_mount "$OUTPUT_DIR" "$SSHFS_RETRIES"
 for md in "${MD_DEVICES[@]}"; do
     log_message "Processing $md..." "${GREEN}"
-    if [[ "$md" == "/dev/md0" ]]; then
-        # Backup swap
-        partclone.swap -c -s "$md" -o "$OUTPUT_DIR/$BACKUP_DIR/$(basename $md).img" | pv -s 1G || {
-            log_message "Failed to backup swap $md." "${RED}"
-            exit 1
-        }
-    else
-        # Backup ext4 filesystem
-        partclone.ext4 -c -s "$md" -o "$OUTPUT_DIR/$BACKUP_DIR/$(basename $md).img" | pv || {
-            log_message "Failed to backup filesystem $md." "${RED}"
-            exit 1
-        }
-    fi
+    partclone.ext4 -c -s "$md" -o "$OUTPUT_DIR/$BACKUP_DIR/$(basename $md).img" | pv || {
+        log_message "Failed to backup filesystem $md." "${RED}"
+        exit 1
+    }
     log_message "Backup of $md completed." "${GREEN}"
 done
 log_message "All filesystems backed up." "${GREEN}"
@@ -320,11 +305,11 @@ log_message "Step 19: Backup complete! ISO saved to $OUTPUT_DIR/$ISO_NAME" "${GR
 log_message "Next steps:" "${YELLOW}"
 log_message "1. Test the ISO in a virtual machine (e.g., VirtualBox, QEMU) to ensure it boots correctly." "${YELLOW}"
 log_message "2. Store the ISO securely, preferably encrypted (e.g., 'gpg -c $ISO_NAME')." "${YELLOW}"
-log_message "3. To restore, boot from a live CD/USB (e.g., SystemRescueCD), extract the tar.gz, restore filesystems with 'partclone', and rebuild RAID1 with 'mdadm'." "${YELLOW}"
+log_message "3. To restore, boot from a live CD/USB (e.g., SystemRescueCD), extract the tar.gz, restore filesystems with 'partclone', recreate swap, and rebuild RAID1 with 'mdadm'." "${YELLOW}"
 log_message "4. Example restoration commands:" "${YELLOW}"
 log_message "   - Extract: tar -xzf /path/to/backup.tar.gz" "${YELLOW}"
-log_message "   - Restore swap: partclone.swap -r -s backup/md0.img -o /dev/md0" "${YELLOW}"
 log_message "   - Restore ext4: partclone.ext4 -r -s backup/md1.img -o /dev/md1" "${YELLOW}"
+log_message "   - Recreate swap: mkswap /dev/md0" "${YELLOW}"
 log_message "   - Rebuild RAID: mdadm --create /dev/md0 --level=1 --raid-devices=2 /dev/sda1 /dev/sdb1" "${YELLOW}"
 
 exit 0
